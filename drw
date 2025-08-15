@@ -1,1601 +1,920 @@
--- Performance-Optimized Drawing Library
--- Zero FPS loss, smooth rendering, object pooling, batch updates
-
 local coreGui = game:GetService("CoreGui")
+
 local camera = workspace.CurrentCamera
-local runService = game:GetService("RunService")
-local userInputService = game:GetService("UserInputService")
-
--- Performance constants
-local MAX_POOL_SIZE = 1000
-local BATCH_SIZE = 50
-local CULLING_MARGIN = 100
-
--- Global state
 local drawingUI = Instance.new("ScreenGui")
 drawingUI.Name = "DrawingLibrary"
 drawingUI.IgnoreGuiInset = true
 drawingUI.DisplayOrder = 0x7fffffff
 drawingUI.Parent = coreGui
 
--- Object pools for memory efficiency
-local objectPools = {
-    Line = {},
-    Text = {},
-    Circle = {},
-    Square = {},
-    Image = {},
-    Quad = {},
-    Triangle = {},
-    Frame = {},
-    TextButton = {},
-    TextLabel = {},
-    TextBox = {}
+local drawingIndex = 0
+local drawingFontsEnum = {
+	[0] = Font.fromEnum(Enum.Font.Roboto),
+	[1] = Font.fromEnum(Enum.Font.Legacy),
+	[2] = Font.fromEnum(Enum.Font.SourceSans),
+	[3] = Font.fromEnum(Enum.Font.RobotoMono)
 }
 
--- Active objects tracking
-local activeObjects = {}
-local dirtyObjects = {}
-local renderQueue = {}
+local function getFontFromIndex(fontIndex)
+	return drawingFontsEnum[fontIndex]
+end
+
+local function convertTransparency(transparency)
+	return math.clamp(1 - transparency, 0, 1)
+end
+
+local baseDrawingObj = setmetatable({
+	Visible = true,
+	ZIndex = 0,
+	Transparency = 1,
+	Color = Color3.new(),
+	Remove = function(self)
+		setmetatable(self, nil)
+	end,
+	Destroy = function(self)
+		setmetatable(self, nil)
+	end,
+	SetProperty = function(self, index, value)
+		if self[index] ~= nil then
+			self[index] = value
+		else
+			warn("Attempted to set invalid property: " .. tostring(index))
+		end
+	end,
+	GetProperty = function(self, index)
+		if self[index] ~= nil then
+			return self[index]
+		else
+			warn("Attempted to get invalid property: " .. tostring(index))
+			return nil
+		end
+	end,
+	SetParent = function(self, parent)
+		self.Parent = parent
+	end
+}, {
+	__add = function(t1, t2)
+		local result = {}
+		for index, value in pairs(t1) do
+			result[index] = value
+		end
+		for index, value in pairs(t2) do
+			result[index] = value
+		end
+		return result
+	end
+})
 
--- Performance monitoring
-local frameCount = 0
-local lastFrameTime = tick()
-local fpsCounter = 0
-
--- Utility functions
-local function getFromPool(objectType)
-    local pool = objectPools[objectType]
-    if #pool > 0 then
-        return table.remove(pool)
-    end
-    return nil
-end
-
-local function returnToPool(objectType, obj)
-    local pool = objectPools[objectType]
-    if #pool < MAX_POOL_SIZE then
-        -- Reset object state
-        if obj.Reset then
-            obj:Reset()
-        end
-        table.insert(pool, obj)
-    end
-end
-
-local function isOnScreen(position, size)
-    local viewportSize = camera.ViewportSize
-    return position.X + size.X > -CULLING_MARGIN and 
-           position.X < viewportSize.X + CULLING_MARGIN and
-           position.Y + size.Y > -CULLING_MARGIN and 
-           position.Y < viewportSize.Y + CULLING_MARGIN
-end
-
--- Optimized base object with minimal overhead
-local BaseObject = {}
-BaseObject.__index = BaseObject
-
-function BaseObject.new()
-    local self = setmetatable({}, BaseObject)
-    self._properties = {}
-    self._dirty = false
-    self._visible = true
-    self._zIndex = 0
-    self._transparency = 1
-    self._color = Color3.new(1, 1, 1)
-    self._parent = drawingUI
-    return self
-end
-
-function BaseObject:SetProperty(key, value)
-    if self._properties[key] ~= value then
-        self._properties[key] = value
-        self._dirty = true
-        if not dirtyObjects[self] then
-            dirtyObjects[self] = true
-        end
-    end
-end
-
-function BaseObject:GetProperty(key)
-    return self._properties[key]
-end
-
-function BaseObject:SetVisible(visible)
-    if self._visible ~= visible then
-        self._visible = visible
-        self._dirty = true
-        if not dirtyObjects[self] then
-            dirtyObjects[self] = true
-        end
-    end
-end
-
-function BaseObject:SetZIndex(zIndex)
-    if self._zIndex ~= zIndex then
-        self._zIndex = zIndex
-        self._dirty = true
-        if not dirtyObjects[self] then
-            dirtyObjects[self] = true
-        end
-    end
-end
-
-function BaseObject:SetTransparency(transparency)
-    if self._transparency ~= transparency then
-        self._transparency = transparency
-        self._dirty = true
-        if not dirtyObjects[self] then
-            dirtyObjects[self] = true
-        end
-    end
-end
-
-function BaseObject:SetColor(color)
-    if self._color ~= color then
-        self._color = color
-        self._dirty = true
-        if not dirtyObjects[self] then
-            dirtyObjects[self] = true
-        end
-    end
-end
-
-function BaseObject:Remove()
-    if activeObjects[self] then
-        activeObjects[self] = nil
-        dirtyObjects[self] = nil
-        if self._uiObject then
-            self._uiObject:Destroy()
-            self._uiObject = nil
-        end
-        returnToPool(self._type, self)
-    end
-end
-
-function BaseObject:Destroy()
-    self:Remove()
-end
-
--- Add metatable support for property access
-function BaseObject:__newindex(key, value)
-    if key == "Visible" then
-        self:SetVisible(value)
-    elseif key == "ZIndex" then
-        self:SetZIndex(value)
-    elseif key == "Transparency" then
-        self:SetTransparency(value)
-    elseif key == "Color" then
-        self:SetColor(value)
-    elseif key == "Parent" then
-        self._parent = value
-        if self._uiObject then
-            self._uiObject.Parent = value
-        end
-    else
-        self:SetProperty(key, value)
-    end
-end
-
-function BaseObject:__index(key)
-    if key == "Visible" then
-        return self._visible
-    elseif key == "ZIndex" then
-        return self._zIndex
-    elseif key == "Transparency" then
-        return self._transparency
-    elseif key == "Color" then
-        return self._color
-    elseif key == "Parent" then
-        return self._parent
-    elseif key == "Remove" or key == "Destroy" then
-        return function()
-            self:Remove()
-        end
-    else
-        return self:GetProperty(key)
-    end
-end
-
--- Optimized Line object
-local Line = setmetatable({}, {__index = BaseObject})
-Line.__index = Line
-
-function Line.new()
-    local self = setmetatable(BaseObject.new(), Line)
-    self._type = "Line"
-    self._from = Vector2.zero
-    self._to = Vector2.zero
-    self._thickness = 1
-    self._uiObject = nil
-    return self
-end
-
-function Line:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("Frame")
-        self._uiObject.Name = "Line"
-        self._uiObject.AnchorPoint = Vector2.new(0.5, 0.5)
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.Parent = self._parent
-    end
-    
-    local direction = self._to - self._from
-    local center = (self._to + self._from) / 2
-    local distance = direction.Magnitude
-    local theta = math.deg(math.atan2(direction.Y, direction.X))
-    
-    self._uiObject.Position = UDim2.fromOffset(center.X, center.Y)
-    self._uiObject.Rotation = theta
-    self._uiObject.Size = UDim2.fromOffset(distance, self._thickness)
-    self._uiObject.BackgroundColor3 = self._color
-    self._uiObject.BackgroundTransparency = 1 - self._transparency
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function Line:Reset()
-    self._from = Vector2.zero
-    self._to = Vector2.zero
-    self._thickness = 1
-    self._dirty = false
-end
-
--- Add specific property setters for Line
-function Line:__newindex(key, value)
-    if key == "From" then
-        if self._from ~= value then
-            self._from = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "To" then
-        if self._to ~= value then
-            self._to = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Thickness" then
-        if self._thickness ~= value then
-            self._thickness = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Line:__index(key)
-    if key == "From" then
-        return self._from
-    elseif key == "To" then
-        return self._to
-    elseif key == "Thickness" then
-        return self._thickness
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Text object
-local Text = setmetatable({}, {__index = BaseObject})
-Text.__index = Text
-
-function Text.new()
-    local self = setmetatable(BaseObject.new(), Text)
-    self._type = "Text"
-    self._text = ""
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = Vector2.zero
-    self._center = false
-    self._outline = false
-    self._outlineColor = Color3.new(0, 0, 0)
-    self._uiObject = nil
-    self._outlineObject = nil
-    return self
-end
-
-function Text:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("TextLabel")
-        self._uiObject.Name = "Text"
-        self._uiObject.AnchorPoint = Vector2.new(0.5, 0.5)
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.BackgroundTransparency = 1
-        self._uiObject.Parent = self._parent
-        
-        self._outlineObject = Instance.new("UIStroke")
-        self._outlineObject.Thickness = 1
-        self._outlineObject.Parent = self._uiObject
-    end
-    
-    self._uiObject.Text = self._text
-    self._uiObject.FontFace = self._font
-    self._uiObject.TextSize = self._size
-    self._uiObject.TextColor3 = self._color
-    self._uiObject.TextTransparency = 1 - self._transparency
-    self._uiObject.ZIndex = self._zIndex
-    
-    local textBounds = self._uiObject.TextBounds
-    local offset = textBounds / 2
-    self._uiObject.Size = UDim2.fromOffset(textBounds.X, textBounds.Y)
-    
-    local finalPosition = self._position
-    if self._center then
-        finalPosition = camera.ViewportSize / 2
-    end
-    
-    self._uiObject.Position = UDim2.fromOffset(
-        finalPosition.X + (not self._center and offset.X or 0),
-        finalPosition.Y + offset.Y
-    )
-    
-    self._outlineObject.Enabled = self._outline
-    self._outlineObject.Color = self._outlineColor
-    self._outlineObject.Transparency = 1 - self._transparency
-end
-
-function Text:Reset()
-    self._text = ""
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = Vector2.zero
-    self._center = false
-    self._outline = false
-    self._outlineColor = Color3.new(0, 0, 0)
-    self._dirty = false
-end
-
--- Add specific property setters for Text
-function Text:__newindex(key, value)
-    if key == "Text" then
-        if self._text ~= value then
-            self._text = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Font" then
-        if self._font ~= value then
-            self._font = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Center" then
-        if self._center ~= value then
-            self._center = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Outline" then
-        if self._outline ~= value then
-            self._outline = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "OutlineColor" then
-        if self._outlineColor ~= value then
-            self._outlineColor = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Text:__index(key)
-    if key == "Text" then
-        return self._text
-    elseif key == "Font" then
-        return self._font
-    elseif key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    elseif key == "Center" then
-        return self._center
-    elseif key == "Outline" then
-        return self._outline
-    elseif key == "OutlineColor" then
-        return self._outlineColor
-    elseif key == "TextBounds" then
-        return self._uiObject and self._uiObject.TextBounds or Vector2.zero
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Circle object
-local Circle = setmetatable({}, {__index = BaseObject})
-Circle.__index = Circle
-
-function Circle.new()
-    local self = setmetatable(BaseObject.new(), Circle)
-    self._type = "Circle"
-    self._radius = 150
-    self._position = Vector2.zero
-    self._thickness = 0.7
-    self._filled = false
-    self._uiObject = nil
-    self._cornerObject = nil
-    self._strokeObject = nil
-    return self
-end
-
-function Circle:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("Frame")
-        self._uiObject.Name = "Circle"
-        self._uiObject.AnchorPoint = Vector2.new(0.5, 0.5)
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.Parent = self._parent
-        
-        self._cornerObject = Instance.new("UICorner")
-        self._cornerObject.CornerRadius = UDim.new(1, 0)
-        self._cornerObject.Parent = self._uiObject
-        
-        self._strokeObject = Instance.new("UIStroke")
-        self._strokeObject.Thickness = self._thickness
-        self._strokeObject.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-        self._strokeObject.Parent = self._uiObject
-    end
-    
-    local diameter = self._radius * 2
-    self._uiObject.Size = UDim2.fromOffset(diameter, diameter)
-    self._uiObject.Position = UDim2.fromOffset(self._position.X, self._position.Y)
-    self._uiObject.BackgroundColor3 = self._color
-    self._uiObject.BackgroundTransparency = self._filled and (1 - self._transparency) or 1
-    self._uiObject.ZIndex = self._zIndex
-    
-    self._strokeObject.Thickness = math.clamp(self._thickness, 0.6, 0x7fffffff)
-    self._strokeObject.Enabled = not self._filled
-    self._strokeObject.Color = self._color
-    self._strokeObject.Transparency = 1 - self._transparency
-end
-
-function Circle:Reset()
-    self._radius = 150
-    self._position = Vector2.zero
-    self._thickness = 0.7
-    self._filled = false
-    self._dirty = false
-end
-
--- Add specific property setters for Circle
-function Circle:__newindex(key, value)
-    if key == "Radius" then
-        if self._radius ~= value then
-            self._radius = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Thickness" then
-        if self._thickness ~= value then
-            self._thickness = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Filled" then
-        if self._filled ~= value then
-            self._filled = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Circle:__index(key)
-    if key == "Radius" then
-        return self._radius
-    elseif key == "Position" then
-        return self._position
-    elseif key == "Thickness" then
-        return self._thickness
-    elseif key == "Filled" then
-        return self._filled
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Square object
-local Square = setmetatable({}, {__index = BaseObject})
-Square.__index = Square
-
-function Square.new()
-    local self = setmetatable(BaseObject.new(), Square)
-    self._type = "Square"
-    self._size = Vector2.zero
-    self._position = Vector2.zero
-    self._thickness = 0.7
-    self._filled = false
-    self._uiObject = nil
-    self._strokeObject = nil
-    return self
-end
-
-function Square:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("Frame")
-        self._uiObject.Name = "Square"
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.Parent = self._parent
-        
-        self._strokeObject = Instance.new("UIStroke")
-        self._strokeObject.Thickness = self._thickness
-        self._strokeObject.Parent = self._uiObject
-    end
-    
-    self._uiObject.Size = UDim2.fromOffset(self._size.X, self._size.Y)
-    self._uiObject.Position = UDim2.fromOffset(self._position.X, self._position.Y)
-    self._uiObject.BackgroundColor3 = self._color
-    self._uiObject.BackgroundTransparency = self._filled and (1 - self._transparency) or 1
-    self._uiObject.ZIndex = self._zIndex
-    
-    self._strokeObject.Thickness = math.clamp(self._thickness, 0.6, 0x7fffffff)
-    self._strokeObject.Enabled = not self._filled
-    self._strokeObject.Color = self._color
-    self._strokeObject.Transparency = 1 - self._transparency
-end
-
-function Square:Reset()
-    self._size = Vector2.zero
-    self._position = Vector2.zero
-    self._thickness = 0.7
-    self._filled = false
-    self._dirty = false
-end
-
--- Add specific property setters for Square
-function Square:__newindex(key, value)
-    if key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Thickness" then
-        if self._thickness ~= value then
-            self._thickness = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Filled" then
-        if self._filled ~= value then
-            self._filled = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Square:__index(key)
-    if key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    elseif key == "Thickness" then
-        return self._thickness
-    elseif key == "Filled" then
-        return self._filled
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Image object
-local Image = setmetatable({}, {__index = BaseObject})
-Image.__index = Image
-
-function Image.new()
-    local self = setmetatable(BaseObject.new(), Image)
-    self._type = "Image"
-    self._data = ""
-    self._dataURL = "rbxassetid://0"
-    self._size = Vector2.zero
-    self._position = Vector2.zero
-    self._uiObject = nil
-    return self
-end
-
-function Image:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("ImageLabel")
-        self._uiObject.Name = "Image"
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.ScaleType = Enum.ScaleType.Stretch
-        self._uiObject.BackgroundTransparency = 1
-        self._uiObject.Parent = self._parent
-    end
-    
-    self._uiObject.Image = self._dataURL
-    self._uiObject.Size = UDim2.fromOffset(self._size.X, self._size.Y)
-    self._uiObject.Position = UDim2.fromOffset(self._position.X, self._position.Y)
-    self._uiObject.ImageTransparency = 1 - self._transparency
-    self._uiObject.ImageColor3 = self._color
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function Image:Reset()
-    self._data = ""
-    self._dataURL = "rbxassetid://0"
-    self._size = Vector2.zero
-    self._position = Vector2.zero
-    self._dirty = false
-end
-
--- Add specific property setters for Image
-function Image:__newindex(key, value)
-    if key == "Data" then
-        if self._data ~= value then
-            self._data = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "DataURL" then
-        if self._dataURL ~= value then
-            self._dataURL = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Image:__index(key)
-    if key == "Data" then
-        return self._data
-    elseif key == "DataURL" then
-        return self._dataURL
-    elseif key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Quad object
-local Quad = setmetatable({}, {__index = BaseObject})
-Quad.__index = Quad
-
-function Quad.new()
-    local self = setmetatable(BaseObject.new(), Quad)
-    self._type = "Quad"
-    self._pointA = Vector2.zero
-    self._pointB = Vector2.zero
-    self._pointC = Vector2.zero
-    self._pointD = Vector2.zero
-    self._thickness = 1
-    self._filled = false
-    self._lineObjects = {}
-    self._fillObject = nil
-    return self
-end
-
-function Quad:Update()
-    if not self._visible then return end
-    
-    -- Create line objects if they don't exist
-    if #self._lineObjects == 0 then
-        for i = 1, 4 do
-            local line = Line.new()
-            line._parent = self._parent
-            table.insert(self._lineObjects, line)
-        end
-    end
-    
-    -- Create fill object if it doesn't exist
-    if not self._fillObject then
-        self._fillObject = Instance.new("Frame")
-        self._fillObject.Name = "QuadFill"
-        self._fillObject.BorderSizePixel = 0
-        self._fillObject.Parent = self._parent
-    end
-    
-    -- Update line positions
-    local points = {self._pointA, self._pointB, self._pointC, self._pointD}
-    for i = 1, 4 do
-        local line = self._lineObjects[i]
-        line._from = points[i]
-        line._to = points[(i % 4) + 1]
-        line._thickness = self._thickness
-        line._color = self._color
-        line._transparency = self._filled and 1 or self._transparency
-        line._visible = self._visible
-        line._zIndex = self._zIndex
-        line:Update()
-    end
-    
-    -- Update fill
-    self._fillObject.Visible = self._visible and self._filled
-    self._fillObject.BackgroundColor3 = self._color
-    self._fillObject.BackgroundTransparency = 1 - self._transparency
-    self._fillObject.ZIndex = self._zIndex
-    
-    -- Calculate fill position and size (simplified)
-    local minX = math.min(self._pointA.X, self._pointB.X, self._pointC.X, self._pointD.X)
-    local minY = math.min(self._pointA.Y, self._pointB.Y, self._pointC.Y, self._pointD.Y)
-    local maxX = math.max(self._pointA.X, self._pointB.X, self._pointC.X, self._pointD.X)
-    local maxY = math.max(self._pointA.Y, self._pointB.Y, self._pointC.Y, self._pointD.Y)
-    
-    self._fillObject.Position = UDim2.fromOffset(minX, minY)
-    self._fillObject.Size = UDim2.fromOffset(maxX - minX, maxY - minY)
-end
-
-function Quad:Reset()
-    self._pointA = Vector2.zero
-    self._pointB = Vector2.zero
-    self._pointC = Vector2.zero
-    self._pointD = Vector2.zero
-    self._thickness = 1
-    self._filled = false
-    self._dirty = false
-end
-
--- Add specific property setters for Quad
-function Quad:__newindex(key, value)
-    if key == "PointA" then
-        if self._pointA ~= value then
-            self._pointA = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "PointB" then
-        if self._pointB ~= value then
-            self._pointB = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "PointC" then
-        if self._pointC ~= value then
-            self._pointC = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "PointD" then
-        if self._pointD ~= value then
-            self._pointD = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Thickness" then
-        if self._thickness ~= value then
-            self._thickness = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Filled" then
-        if self._filled ~= value then
-            self._filled = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Quad:__index(key)
-    if key == "PointA" then
-        return self._pointA
-    elseif key == "PointB" then
-        return self._pointB
-    elseif key == "PointC" then
-        return self._pointC
-    elseif key == "PointD" then
-        return self._pointD
-    elseif key == "Thickness" then
-        return self._thickness
-    elseif key == "Filled" then
-        return self._filled
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Triangle object
-local Triangle = setmetatable({}, {__index = BaseObject})
-Triangle.__index = Triangle
-
-function Triangle.new()
-    local self = setmetatable(BaseObject.new(), Triangle)
-    self._type = "Triangle"
-    self._pointA = Vector2.zero
-    self._pointB = Vector2.zero
-    self._pointC = Vector2.zero
-    self._thickness = 1
-    self._filled = false
-    self._lineObjects = {}
-    self._fillObject = nil
-    return self
-end
-
-function Triangle:Update()
-    if not self._visible then return end
-    
-    -- Create line objects if they don't exist
-    if #self._lineObjects == 0 then
-        for i = 1, 3 do
-            local line = Line.new()
-            line._parent = self._parent
-            table.insert(self._lineObjects, line)
-        end
-    end
-    
-    -- Create fill object if it doesn't exist
-    if not self._fillObject then
-        self._fillObject = Instance.new("Frame")
-        self._fillObject.Name = "TriangleFill"
-        self._fillObject.BorderSizePixel = 0
-        self._fillObject.Parent = self._parent
-    end
-    
-    -- Update line positions
-    local points = {self._pointA, self._pointB, self._pointC}
-    for i = 1, 3 do
-        local line = self._lineObjects[i]
-        line._from = points[i]
-        line._to = points[(i % 3) + 1]
-        line._thickness = self._thickness
-        line._color = self._color
-        line._transparency = self._filled and 1 or self._transparency
-        line._visible = self._visible
-        line._zIndex = self._zIndex
-        line:Update()
-    end
-    
-    -- Update fill
-    self._fillObject.Visible = self._visible and self._filled
-    self._fillObject.BackgroundColor3 = self._color
-    self._fillObject.BackgroundTransparency = 1 - self._transparency
-    self._fillObject.ZIndex = self._zIndex
-    
-    -- Calculate fill position and size (simplified)
-    local minX = math.min(self._pointA.X, self._pointB.X, self._pointC.X)
-    local minY = math.min(self._pointA.Y, self._pointB.Y, self._pointC.Y)
-    local maxX = math.max(self._pointA.X, self._pointB.X, self._pointC.X)
-    local maxY = math.max(self._pointA.Y, self._pointB.Y, self._pointC.Y)
-    
-    self._fillObject.Position = UDim2.fromOffset(minX, minY)
-    self._fillObject.Size = UDim2.fromOffset(maxX - minX, maxY - minY)
-end
-
-function Triangle:Reset()
-    self._pointA = Vector2.zero
-    self._pointB = Vector2.zero
-    self._pointC = Vector2.zero
-    self._thickness = 1
-    self._filled = false
-    self._dirty = false
-end
-
--- Add specific property setters for Triangle
-function Triangle:__newindex(key, value)
-    if key == "PointA" then
-        if self._pointA ~= value then
-            self._pointA = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "PointB" then
-        if self._pointB ~= value then
-            self._pointB = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "PointC" then
-        if self._pointC ~= value then
-            self._pointC = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Thickness" then
-        if self._thickness ~= value then
-            self._thickness = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Filled" then
-        if self._filled ~= value then
-            self._filled = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Triangle:__index(key)
-    if key == "PointA" then
-        return self._pointA
-    elseif key == "PointB" then
-        return self._pointB
-    elseif key == "PointC" then
-        return self._pointC
-    elseif key == "Thickness" then
-        return self._thickness
-    elseif key == "Filled" then
-        return self._filled
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized Frame object
-local Frame = setmetatable({}, {__index = BaseObject})
-Frame.__index = Frame
-
-function Frame.new()
-    local self = setmetatable(BaseObject.new(), Frame)
-    self._type = "Frame"
-    self._size = UDim2.new(0, 100, 0, 100)
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._uiObject = nil
-    return self
-end
-
-function Frame:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("Frame")
-        self._uiObject.Name = "Frame"
-        self._uiObject.BorderSizePixel = 0
-        self._uiObject.Parent = self._parent
-    end
-    
-    self._uiObject.Size = self._size
-    self._uiObject.Position = self._position
-    self._uiObject.BackgroundColor3 = self._color
-    self._uiObject.BackgroundTransparency = 1 - self._transparency
-    self._uiObject.Visible = self._visible
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function Frame:Reset()
-    self._size = UDim2.new(0, 100, 0, 100)
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._dirty = false
-end
-
--- Add specific property setters for Frame
-function Frame:__newindex(key, value)
-    if key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function Frame:__index(key)
-    if key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized TextButton object
-local TextButton = setmetatable({}, {__index = BaseObject})
-TextButton.__index = TextButton
-
-function TextButton.new()
-    local self = setmetatable(BaseObject.new(), TextButton)
-    self._type = "TextButton"
-    self._text = "Button"
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._uiObject = nil
-    self._clickCallback = nil
-    return self
-end
-
-function TextButton:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("TextButton")
-        self._uiObject.Name = "TextButton"
-        self._uiObject.Parent = self._parent
-        
-        -- Connect click event
-        self._uiObject.MouseButton1Click:Connect(function()
-            if self._clickCallback then
-                self._clickCallback()
-            end
-        end)
-    end
-    
-    self._uiObject.Text = self._text
-    self._uiObject.FontFace = self._font
-    self._uiObject.TextSize = self._size
-    self._uiObject.Position = self._position
-    self._uiObject.TextColor3 = self._color
-    self._uiObject.BackgroundColor3 = self._backgroundColor
-    self._uiObject.BackgroundTransparency = 1 - self._transparency
-    self._uiObject.Visible = self._visible
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function TextButton:Reset()
-    self._text = "Button"
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._clickCallback = nil
-    self._dirty = false
-end
-
--- Add specific property setters for TextButton
-function TextButton:__newindex(key, value)
-    if key == "Text" then
-        if self._text ~= value then
-            self._text = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Font" then
-        if self._font ~= value then
-            self._font = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "BackgroundColor" then
-        if self._backgroundColor ~= value then
-            self._backgroundColor = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "MouseButton1Click" then
-        if typeof(value) == "function" then
-            self._clickCallback = value
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function TextButton:__index(key)
-    if key == "Text" then
-        return self._text
-    elseif key == "Font" then
-        return self._font
-    elseif key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    elseif key == "BackgroundColor" then
-        return self._backgroundColor
-    elseif key == "MouseButton1Click" then
-        return self._clickCallback
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized TextLabel object
-local TextLabel = setmetatable({}, {__index = BaseObject})
-TextLabel.__index = TextLabel
-
-function TextLabel.new()
-    local self = setmetatable(BaseObject.new(), TextLabel)
-    self._type = "TextLabel"
-    self._text = "Label"
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._uiObject = nil
-    return self
-end
-
-function TextLabel:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("TextLabel")
-        self._uiObject.Name = "TextLabel"
-        self._uiObject.Parent = self._parent
-    end
-    
-    self._uiObject.Text = self._text
-    self._uiObject.FontFace = self._font
-    self._uiObject.TextSize = self._size
-    self._uiObject.Position = self._position
-    self._uiObject.TextColor3 = self._color
-    self._uiObject.BackgroundColor3 = self._backgroundColor
-    self._uiObject.BackgroundTransparency = 1 - self._transparency
-    self._uiObject.Visible = self._visible
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function TextLabel:Reset()
-    self._text = "Label"
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._dirty = false
-end
-
--- Add specific property setters for TextLabel
-function TextLabel:__newindex(key, value)
-    if key == "Text" then
-        if self._text ~= value then
-            self._text = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Font" then
-        if self._font ~= value then
-            self._font = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "BackgroundColor" then
-        if self._backgroundColor ~= value then
-            self._backgroundColor = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function TextLabel:__index(key)
-    if key == "Text" then
-        return self._text
-    elseif key == "Font" then
-        return self._font
-    elseif key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    elseif key == "BackgroundColor" then
-        return self._backgroundColor
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Optimized TextBox object
-local TextBox = setmetatable({}, {__index = BaseObject})
-TextBox.__index = TextBox
-
-function TextBox.new()
-    local self = setmetatable(BaseObject.new(), TextBox)
-    self._type = "TextBox"
-    self._text = ""
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._uiObject = nil
-    return self
-end
-
-function TextBox:Update()
-    if not self._visible then return end
-    
-    if not self._uiObject then
-        self._uiObject = Instance.new("TextBox")
-        self._uiObject.Name = "TextBox"
-        self._uiObject.Parent = self._parent
-    end
-    
-    self._uiObject.Text = self._text
-    self._uiObject.FontFace = self._font
-    self._uiObject.TextSize = self._size
-    self._uiObject.Position = self._position
-    self._uiObject.TextColor3 = self._color
-    self._uiObject.BackgroundColor3 = self._backgroundColor
-    self._uiObject.BackgroundTransparency = 1 - self._transparency
-    self._uiObject.Visible = self._visible
-    self._uiObject.ZIndex = self._zIndex
-end
-
-function TextBox:Reset()
-    self._text = ""
-    self._font = Enum.Font.Roboto
-    self._size = 20
-    self._position = UDim2.new(0, 0, 0, 0)
-    self._backgroundColor = Color3.new(0.2, 0.2, 0.2)
-    self._dirty = false
-end
-
--- Add specific property setters for TextBox
-function TextBox:__newindex(key, value)
-    if key == "Text" then
-        if self._text ~= value then
-            self._text = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Font" then
-        if self._font ~= value then
-            self._font = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Size" then
-        if self._size ~= value then
-            self._size = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "Position" then
-        if self._position ~= value then
-            self._position = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    elseif key == "BackgroundColor" then
-        if self._backgroundColor ~= value then
-            self._backgroundColor = value
-            self._dirty = true
-            if not dirtyObjects[self] then
-                dirtyObjects[self] = true
-            end
-        end
-    else
-        BaseObject.__newindex(self, key, value)
-    end
-end
-
-function TextBox:__index(key)
-    if key == "Text" then
-        return self._text
-    elseif key == "Font" then
-        return self._font
-    elseif key == "Size" then
-        return self._size
-    elseif key == "Position" then
-        return self._position
-    elseif key == "BackgroundColor" then
-        return self._backgroundColor
-    else
-        return BaseObject.__index(self, key)
-    end
-end
-
--- Main Drawing Library
 local DrawingLib = {}
-
 DrawingLib.Fonts = {
-    ["UI"] = Enum.Font.Roboto,
-    ["System"] = Enum.Font.Legacy,
-    ["Plex"] = Enum.Font.SourceSans,
-    ["Monospace"] = Enum.Font.RobotoMono
+	["UI"] = 0,
+	["System"] = 1,
+	["Plex"] = 2,
+	["Monospace"] = 3
 }
 
--- Factory functions with object pooling
 function DrawingLib.createLine()
-    local obj = getFromPool("Line") or Line.new()
-    activeObjects[obj] = true
-    return obj
+	local lineObj = ({
+		From = Vector2.zero,
+		To = Vector2.zero,
+		Thickness = 1
+	} + baseDrawingObj)
+
+	local lineFrame = Instance.new("Frame")
+	lineFrame.Name = drawingIndex
+	lineFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	lineFrame.BorderSizePixel = 0
+
+	lineFrame.Parent = drawingUI
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if lineObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "From" or index == "To" then
+				local direction = (index == "From" and lineObj.To or value) - (index == "From" and value or lineObj.From)
+				local center = (lineObj.To + lineObj.From) / 2
+				local distance = direction.Magnitude
+				local theta = math.deg(math.atan2(direction.Y, direction.X))
+
+				lineFrame.Position = UDim2.fromOffset(center.X, center.Y)
+				lineFrame.Rotation = theta
+				lineFrame.Size = UDim2.fromOffset(distance, lineObj.Thickness)
+			elseif index == "Thickness" then
+				lineFrame.Size = UDim2.fromOffset((lineObj.To - lineObj.From).Magnitude, value)
+			elseif index == "Visible" then
+				lineFrame.Visible = value
+			elseif index == "ZIndex" then
+				lineFrame.ZIndex = value
+			elseif index == "Transparency" then
+				lineFrame.BackgroundTransparency = convertTransparency(value)
+			elseif index == "Color" then
+				lineFrame.BackgroundColor3 = value
+			elseif index == "Parent" then
+				lineFrame.Parent = value
+			end
+			lineObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					lineFrame:Destroy()
+					lineObj:Remove()
+				end
+			end
+			return lineObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createText()
-    local obj = getFromPool("Text") or Text.new()
-    activeObjects[obj] = true
-    return obj
+	local textObj = ({
+		Text = "",
+		Font = DrawingLib.Fonts.UI,
+		Size = 0,
+		Position = Vector2.zero,
+		Center = false,
+		Outline = false,
+		OutlineColor = Color3.new()
+	} + baseDrawingObj)
+
+	local textLabel, uiStroke = Instance.new("TextLabel"), Instance.new("UIStroke")
+	textLabel.Name = drawingIndex
+	textLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	textLabel.BorderSizePixel = 0
+	textLabel.BackgroundTransparency = 1
+
+	local function updateTextPosition()
+		local textBounds = textLabel.TextBounds
+		local offset = textBounds / 2
+		textLabel.Size = UDim2.fromOffset(textBounds.X, textBounds.Y)
+		textLabel.Position = UDim2.fromOffset(textObj.Position.X + (not textObj.Center and offset.X or 0), textObj.Position.Y + offset.Y)
+	end
+
+	textLabel:GetPropertyChangedSignal("TextBounds"):Connect(updateTextPosition)
+
+	uiStroke.Thickness = 1
+	uiStroke.Enabled = textObj.Outline
+	uiStroke.Color = textObj.Color
+
+	textLabel.Parent, uiStroke.Parent = drawingUI, textLabel
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if textObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "Text" then
+				textLabel.Text = value
+			elseif index == "Font" then
+				textLabel.FontFace = getFontFromIndex(math.clamp(value, 0, 3))
+			elseif index == "Size" then
+				textLabel.TextSize = value
+			elseif index == "Position" then
+				updateTextPosition()
+			elseif index == "Center" then
+				textLabel.Position = UDim2.fromOffset((value and camera.ViewportSize / 2 or textObj.Position).X, textObj.Position.Y)
+			elseif index == "Outline" then
+				uiStroke.Enabled = value
+			elseif index == "OutlineColor" then
+				uiStroke.Color = value
+			elseif index == "Visible" then
+				textLabel.Visible = value
+			elseif index == "ZIndex" then
+				textLabel.ZIndex = value
+			elseif index == "Transparency" then
+				local transparency = convertTransparency(value)
+				textLabel.TextTransparency = transparency
+				uiStroke.Transparency = transparency
+			elseif index == "Color" then
+				textLabel.TextColor3 = value
+			elseif index == "Parent" then
+				textLabel.Parent = value
+			end
+			textObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					textLabel:Destroy()
+					textObj:Remove()
+				end
+			elseif index == "TextBounds" then
+				return textLabel.TextBounds
+			end
+			return textObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createCircle()
-    local obj = getFromPool("Circle") or Circle.new()
-    activeObjects[obj] = true
-    return obj
+	local circleObj = ({
+		Radius = 150,
+		Position = Vector2.zero,
+		Thickness = 0.7,
+		Filled = false
+	} + baseDrawingObj)
+
+	local circleFrame, uiCorner, uiStroke = Instance.new("Frame"), Instance.new("UICorner"), Instance.new("UIStroke")
+	circleFrame.Name = drawingIndex
+	circleFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	circleFrame.BorderSizePixel = 0
+
+	uiCorner.CornerRadius = UDim.new(1, 0)
+	circleFrame.Size = UDim2.fromOffset(circleObj.Radius, circleObj.Radius)
+	uiStroke.Thickness = circleObj.Thickness
+	uiStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+	circleFrame.Parent, uiCorner.Parent, uiStroke.Parent = drawingUI, circleFrame, circleFrame
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if circleObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "Radius" then
+				local radius = value * 2
+				circleFrame.Size = UDim2.fromOffset(radius, radius)
+			elseif index == "Position" then
+				circleFrame.Position = UDim2.fromOffset(value.X, value.Y)
+			elseif index == "Thickness" then
+				uiStroke.Thickness = math.clamp(value, 0.6, 0x7fffffff)
+			elseif index == "Filled" then
+				circleFrame.BackgroundTransparency = value and convertTransparency(circleObj.Transparency) or 1
+				uiStroke.Enabled = not value
+			elseif index == "Visible" then
+				circleFrame.Visible = value
+			elseif index == "ZIndex" then
+				circleFrame.ZIndex = value
+			elseif index == "Transparency" then
+				local transparency = convertTransparency(value)
+				circleFrame.BackgroundTransparency = circleObj.Filled and transparency or 1
+				uiStroke.Transparency = transparency
+			elseif index == "Color" then
+				circleFrame.BackgroundColor3 = value
+				uiStroke.Color = value
+			elseif index == "Parent" then
+				circleFrame.Parent = value
+			end
+			circleObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					circleFrame:Destroy()
+					circleObj:Remove()
+				end
+			end
+			return circleObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createSquare()
-    local obj = getFromPool("Square") or Square.new()
-    activeObjects[obj] = true
-    return obj
+	local squareObj = ({
+		Size = Vector2.zero,
+		Position = Vector2.zero,
+		Thickness = 0.7,
+		Filled = false
+	} + baseDrawingObj)
+
+	local squareFrame, uiStroke = Instance.new("Frame"), Instance.new("UIStroke")
+	squareFrame.Name = drawingIndex
+	squareFrame.BorderSizePixel = 0
+
+	squareFrame.Parent, uiStroke.Parent = drawingUI, squareFrame
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if squareObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "Size" then
+				squareFrame.Size = UDim2.fromOffset(value.X, value.Y)
+			elseif index == "Position" then
+				squareFrame.Position = UDim2.fromOffset(value.X, value.Y)
+			elseif index == "Thickness" then
+				uiStroke.Thickness = math.clamp(value, 0.6, 0x7fffffff)
+			elseif index == "Filled" then
+				squareFrame.BackgroundTransparency = value and convertTransparency(squareObj.Transparency) or 1
+				uiStroke.Enabled = not value
+			elseif index == "Visible" then
+				squareFrame.Visible = value
+			elseif index == "ZIndex" then
+				squareFrame.ZIndex = value
+			elseif index == "Transparency" then
+				local transparency = convertTransparency(value)
+				squareFrame.BackgroundTransparency = squareObj.Filled and transparency or 1
+				uiStroke.Transparency = transparency
+			elseif index == "Color" then
+				squareFrame.BackgroundColor3 = value
+				uiStroke.Color = value
+			elseif index == "Parent" then
+				squareFrame.Parent = value
+			end
+			squareObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					squareFrame:Destroy()
+					squareObj:Remove()
+				end
+			end
+			return squareObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createImage()
-    local obj = getFromPool("Image") or Image.new()
-    activeObjects[obj] = true
-    return obj
+	local imageObj = ({
+		Data = "",
+		DataURL = "rbxassetid://0",
+		Size = Vector2.zero,
+		Position = Vector2.zero
+	} + baseDrawingObj)
+
+	local imageFrame = Instance.new("ImageLabel")
+	imageFrame.Name = drawingIndex
+	imageFrame.BorderSizePixel = 0
+	imageFrame.ScaleType = Enum.ScaleType.Stretch
+	imageFrame.BackgroundTransparency = 1
+
+	imageFrame.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if imageObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "Data" then
+			elseif index == "DataURL" then
+				imageFrame.Image = value
+			elseif index == "Size" then
+				imageFrame.Size = UDim2.fromOffset(value.X, value.Y)
+			elseif index == "Position" then
+				imageFrame.Position = UDim2.fromOffset(value.X, value.Y)
+			elseif index == "Visible" then
+				imageFrame.Visible = value
+			elseif index == "ZIndex" then
+				imageFrame.ZIndex = value
+			elseif index == "Transparency" then
+				imageFrame.ImageTransparency = convertTransparency(value)
+			elseif index == "Color" then
+				imageFrame.ImageColor3 = value
+			elseif index == "Parent" then
+				imageFrame.Parent = value
+			end
+			imageObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					imageFrame:Destroy()
+					imageObj:Remove()
+				end
+			elseif index == "Data" then
+				return nil 
+			end
+			return imageObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createQuad()
-    local obj = getFromPool("Quad") or Quad.new()
-    activeObjects[obj] = true
-    return obj
+	local quadObj = ({
+		PointA = Vector2.zero,
+		PointB = Vector2.zero,
+		PointC = Vector2.zero,
+		PointD = Vector2.zero,
+		Thickness = 1,
+		Filled = false
+	} + baseDrawingObj)
+
+	local _linePoints = {
+		A = DrawingLib.createLine(),
+		B = DrawingLib.createLine(),
+		C = DrawingLib.createLine(),
+		D = DrawingLib.createLine()
+	}
+
+	local fillFrame = Instance.new("Frame")
+	fillFrame.Name = drawingIndex .. "_Fill"
+	fillFrame.BorderSizePixel = 0
+	fillFrame.BackgroundTransparency = quadObj.Transparency
+	fillFrame.BackgroundColor3 = quadObj.Color
+	fillFrame.ZIndex = quadObj.ZIndex
+	fillFrame.Visible = quadObj.Visible and quadObj.Filled
+
+	fillFrame.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if quadObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "PointA" then
+				_linePoints.A.From = value
+				_linePoints.B.To = value
+			elseif index == "PointB" then
+				_linePoints.B.From = value
+				_linePoints.C.To = value
+			elseif index == "PointC" then
+				_linePoints.C.From = value
+				_linePoints.D.To = value
+			elseif index == "PointD" then
+				_linePoints.D.From = value
+				_linePoints.A.To = value
+			elseif index == "Thickness" or index == "Visible" or index == "Color" or index == "ZIndex" then
+				for _, linePoint in pairs(_linePoints) do
+					linePoint[index] = value
+				end
+				if index == "Visible" then
+					fillFrame.Visible = value and quadObj.Filled
+				elseif index == "Color" then
+					fillFrame.BackgroundColor3 = value
+				elseif index == "ZIndex" then
+					fillFrame.ZIndex = value
+				end
+			elseif index == "Filled" then
+				for _, linePoint in pairs(_linePoints) do
+					linePoint.Transparency = value and 1 or quadObj.Transparency
+				end
+				fillFrame.Visible = value
+			elseif index == "Parent" then
+				fillFrame.Parent = value
+			end
+			quadObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					for _, linePoint in pairs(_linePoints) do
+						linePoint:Remove()
+					end
+					fillFrame:Destroy()
+					quadObj:Remove()
+				end
+			end
+			return quadObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createTriangle()
-    local obj = getFromPool("Triangle") or Triangle.new()
-    activeObjects[obj] = true
-    return obj
+	local triangleObj = ({
+		PointA = Vector2.zero,
+		PointB = Vector2.zero,
+		PointC = Vector2.zero,
+		Thickness = 1,
+		Filled = false
+	} + baseDrawingObj)
+
+	local _linePoints = {
+		A = DrawingLib.createLine(),
+		B = DrawingLib.createLine(),
+		C = DrawingLib.createLine()
+	}
+
+	local fillFrame = Instance.new("Frame")
+	fillFrame.Name = drawingIndex .. "_Fill"
+	fillFrame.BorderSizePixel = 0
+	fillFrame.BackgroundTransparency = triangleObj.Transparency
+	fillFrame.BackgroundColor3 = triangleObj.Color
+	fillFrame.ZIndex = triangleObj.ZIndex
+	fillFrame.Visible = triangleObj.Visible and triangleObj.Filled
+
+	fillFrame.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if triangleObj[index] == nil then 
+				warn("Invalid property: " .. tostring(index))
+				return 
+			end
+
+			if index == "PointA" then
+				_linePoints.A.From = value
+				_linePoints.B.To = value
+			elseif index == "PointB" then
+				_linePoints.B.From = value
+				_linePoints.C.To = value
+			elseif index == "PointC" then
+				_linePoints.C.From = value
+				_linePoints.A.To = value
+			elseif index == "Thickness" or index == "Visible" or index == "Color" or index == "ZIndex" then
+				for _, linePoint in pairs(_linePoints) do
+					linePoint[index] = value
+				end
+				if index == "Visible" then
+					fillFrame.Visible = value and triangleObj.Filled
+				elseif index == "Color" then
+					fillFrame.BackgroundColor3 = value
+				elseif index == "ZIndex" then
+					fillFrame.ZIndex = value
+				end
+			elseif index == "Filled" then
+				for _, linePoint in pairs(_linePoints) do
+					linePoint.Transparency = value and 1 or triangleObj.Transparency
+				end
+				fillFrame.Visible = value
+			elseif index == "Parent" then
+				fillFrame.Parent = value
+			end
+			triangleObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					for _, linePoint in pairs(_linePoints) do
+						linePoint:Remove()
+					end
+					fillFrame:Destroy()
+					triangleObj:Remove()
+				end
+			end
+			return triangleObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createFrame()
-    local obj = getFromPool("Frame") or Frame.new()
-    activeObjects[obj] = true
-    return obj
+	local frameObj = ({
+		Size = UDim2.new(0, 100, 0, 100),
+		Position = UDim2.new(0, 0, 0, 0),
+		Color = Color3.new(1, 1, 1),
+		Transparency = 0,
+		Visible = true,
+		ZIndex = 1
+	} + baseDrawingObj)
+
+	local frame = Instance.new("Frame")
+	frame.Name = drawingIndex
+	frame.Size = frameObj.Size
+	frame.Position = frameObj.Position
+	frame.BackgroundColor3 = frameObj.Color
+	frame.BackgroundTransparency = convertTransparency(frameObj.Transparency)
+	frame.Visible = frameObj.Visible
+	frame.ZIndex = frameObj.ZIndex
+	frame.BorderSizePixel = 0
+
+	frame.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if frameObj[index] == nil then
+				warn("Invalid property: " .. tostring(index))
+				return
+			end
+
+			if index == "Size" then
+				frame.Size = value
+			elseif index == "Position" then
+				frame.Position = value
+			elseif index == "Color" then
+				frame.BackgroundColor3 = value
+			elseif index == "Transparency" then
+				frame.BackgroundTransparency = convertTransparency(value)
+			elseif index == "Visible" then
+				frame.Visible = value
+			elseif index == "ZIndex" then
+				frame.ZIndex = value
+			elseif index == "Parent" then
+				frame.Parent = value
+			end
+			frameObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					frame:Destroy()
+					frameObj:Remove()
+				end
+			end
+			return frameObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
+end
+
+
+function DrawingLib.createScreenGui()
+	local screenGuiObj = ({
+		IgnoreGuiInset = true,
+		DisplayOrder = 0,
+		ResetOnSpawn = true,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Enabled = true
+	} + baseDrawingObj)
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = drawingIndex
+	screenGui.IgnoreGuiInset = screenGuiObj.IgnoreGuiInset
+	screenGui.DisplayOrder = screenGuiObj.DisplayOrder
+	screenGui.ResetOnSpawn = screenGuiObj.ResetOnSpawn
+	screenGui.ZIndexBehavior = screenGuiObj.ZIndexBehavior
+	screenGui.Enabled = screenGuiObj.Enabled
+
+	screenGui.Parent = coreGui
+
+	return setmetatable({Parent = coreGui}, {
+		__newindex = function(_, index, value)
+			if screenGuiObj[index] == nil then
+				warn("Invalid property: " .. tostring(index))
+				return
+			end
+
+			if index == "IgnoreGuiInset" then
+				screenGui.IgnoreGuiInset = value
+			elseif index == "DisplayOrder" then
+				screenGui.DisplayOrder = value
+			elseif index == "ResetOnSpawn" then
+				screenGui.ResetOnSpawn = value
+			elseif index == "ZIndexBehavior" then
+				screenGui.ZIndexBehavior = value
+			elseif index == "Enabled" then
+				screenGui.Enabled = value
+			elseif index == "Parent" then
+				screenGui.Parent = value
+			end
+			screenGuiObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					screenGui:Destroy()
+					screenGuiObj:Remove()
+				end
+			end
+			return screenGuiObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createTextButton()
-    local obj = getFromPool("TextButton") or TextButton.new()
-    activeObjects[obj] = true
-    return obj
+	local buttonObj = ({
+		Text = "Button",
+		Font = DrawingLib.Fonts.UI,
+		Size = 20,
+		Position = UDim2.new(0, 0, 0, 0),
+		Color = Color3.new(1, 1, 1),
+		BackgroundColor = Color3.new(0.2, 0.2, 0.2),
+		Transparency = 0,
+		Visible = true,
+		ZIndex = 1,
+		MouseButton1Click = nil
+	} + baseDrawingObj)
+
+	local button = Instance.new("TextButton")
+	button.Name = drawingIndex
+	button.Text = buttonObj.Text
+	button.FontFace = getFontFromIndex(buttonObj.Font)
+	button.TextSize = buttonObj.Size
+	button.Position = buttonObj.Position
+	button.TextColor3 = buttonObj.Color
+	button.BackgroundColor3 = buttonObj.BackgroundColor
+	button.BackgroundTransparency = convertTransparency(buttonObj.Transparency)
+	button.Visible = buttonObj.Visible
+	button.ZIndex = buttonObj.ZIndex
+
+	button.Parent = drawingUI
+
+	local buttonEvents = {}
+
+	return setmetatable({
+		Parent = drawingUI,
+		Connect = function(_, eventName, callback)
+			if eventName == "MouseButton1Click" then
+				if buttonEvents["MouseButton1Click"] then
+					buttonEvents["MouseButton1Click"]:Disconnect()
+				end
+				buttonEvents["MouseButton1Click"] = button.MouseButton1Click:Connect(callback)
+			else
+				warn("Invalid event: " .. tostring(eventName))
+			end
+		end
+	}, {
+		__newindex = function(_, index, value)
+			if buttonObj[index] == nil then
+				warn("Invalid property: " .. tostring(index))
+				return
+			end
+
+			if index == "Text" then
+				button.Text = value
+			elseif index == "Font" then
+				button.FontFace = getFontFromIndex(math.clamp(value, 0, 3))
+			elseif index == "Size" then
+				button.TextSize = value
+			elseif index == "Position" then
+				button.Position = value
+			elseif index == "Color" then
+				button.TextColor3 = value
+			elseif index == "BackgroundColor" then
+				button.BackgroundColor3 = value
+			elseif index == "Transparency" then
+				button.BackgroundTransparency = convertTransparency(value)
+			elseif index == "Visible" then
+				button.Visible = value
+			elseif index == "ZIndex" then
+				button.ZIndex = value
+			elseif index == "Parent" then
+				button.Parent = value
+			elseif index == "MouseButton1Click" then
+				if typeof(value) == "function" then
+					if buttonEvents["MouseButton1Click"] then
+						buttonEvents["MouseButton1Click"]:Disconnect()
+					end
+					buttonEvents["MouseButton1Click"] = button.MouseButton1Click:Connect(value)
+				else
+					warn("Invalid value for MouseButton1Click: expected function, got " .. typeof(value))
+				end
+			end
+			buttonObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					button:Destroy()
+					buttonObj:Remove()
+				end
+			end
+			return buttonObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createTextLabel()
-    local obj = getFromPool("TextLabel") or TextLabel.new()
-    activeObjects[obj] = true
-    return obj
+	local labelObj = ({
+		Text = "Label",
+		Font = DrawingLib.Fonts.UI,
+		Size = 20,
+		Position = UDim2.new(0, 0, 0, 0),
+		Color = Color3.new(1, 1, 1),
+		BackgroundColor = Color3.new(0.2, 0.2, 0.2),
+		Transparency = 0,
+		Visible = true,
+		ZIndex = 1
+	} + baseDrawingObj)
+
+	local label = Instance.new("TextLabel")
+	label.Name = drawingIndex
+	label.Text = labelObj.Text
+	label.FontFace = getFontFromIndex(labelObj.Font)
+	label.TextSize = labelObj.Size
+	label.Position = labelObj.Position
+	label.TextColor3 = labelObj.Color
+	label.BackgroundColor3 = labelObj.BackgroundColor
+	label.BackgroundTransparency = convertTransparency(labelObj.Transparency)
+	label.Visible = labelObj.Visible
+	label.ZIndex = labelObj.ZIndex
+
+	label.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if labelObj[index] == nil then
+				warn("Invalid property: " .. tostring(index))
+				return
+			end
+
+			if index == "Text" then
+				label.Text = value
+			elseif index == "Font" then
+				label.FontFace = getFontFromIndex(math.clamp(value, 0, 3))
+			elseif index == "Size" then
+				label.TextSize = value
+			elseif index == "Position" then
+				label.Position = value
+			elseif index == "Color" then
+				label.TextColor3 = value
+			elseif index == "BackgroundColor" then
+				label.BackgroundColor3 = value
+			elseif index == "Transparency" then
+				label.BackgroundTransparency = convertTransparency(value)
+			elseif index == "Visible" then
+				label.Visible = value
+			elseif index == "ZIndex" then
+				label.ZIndex = value
+			elseif index == "Parent" then
+				label.Parent = value
+			end
+			labelObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					label:Destroy()
+					labelObj:Remove()
+				end
+			end
+			return labelObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
 function DrawingLib.createTextBox()
-    local obj = getFromPool("TextBox") or TextBox.new()
-    activeObjects[obj] = true
-    return obj
+	local boxObj = ({
+		Text = "",
+		Font = DrawingLib.Fonts.UI,
+		Size = 20,
+		Position = UDim2.new(0, 0, 0, 0),
+		Color = Color3.new(1, 1, 1),
+		BackgroundColor = Color3.new(0.2, 0.2, 0.2),
+		Transparency = 0,
+		Visible = true,
+		ZIndex = 1
+	} + baseDrawingObj)
+
+	local textBox = Instance.new("TextBox")
+	textBox.Name = drawingIndex
+	textBox.Text = boxObj.Text
+	textBox.FontFace = getFontFromIndex(boxObj.Font)
+	textBox.TextSize = boxObj.Size
+	textBox.Position = boxObj.Position
+	textBox.TextColor3 = boxObj.Color
+	textBox.BackgroundColor3 = boxObj.BackgroundColor
+	textBox.BackgroundTransparency = convertTransparency(boxObj.Transparency)
+	textBox.Visible = boxObj.Visible
+	textBox.ZIndex = boxObj.ZIndex
+
+	textBox.Parent = drawingUI
+
+	return setmetatable({Parent = drawingUI}, {
+		__newindex = function(_, index, value)
+			if boxObj[index] == nil then
+				warn("Invalid property: " .. tostring(index))
+				return
+			end
+
+			if index == "Text" then
+				textBox.Text = value
+			elseif index == "Font" then
+				textBox.FontFace = getFontFromIndex(math.clamp(value, 0, 3))
+			elseif index == "Size" then
+				textBox.TextSize = value
+			elseif index == "Position" then
+				textBox.Position = value
+			elseif index == "Color" then
+				textBox.TextColor3 = value
+			elseif index == "BackgroundColor" then
+				textBox.BackgroundColor3 = value
+			elseif index == "Transparency" then
+				textBox.BackgroundTransparency = convertTransparency(value)
+			elseif index == "Visible" then
+				textBox.Visible = value
+			elseif index == "ZIndex" then
+				textBox.ZIndex = value
+			elseif index == "Parent" then
+				textBox.Parent = value
+			end
+			boxObj[index] = value
+		end,
+		__index = function(self, index)
+			if index == "Remove" or index == "Destroy" then
+				return function()
+					textBox:Destroy()
+					boxObj:Remove()
+				end
+			end
+			return boxObj[index]
+		end,
+		__tostring = function() return "Drawing" end
+	})
 end
 
--- Batch rendering system
-local function processRenderQueue()
-    local processed = 0
-    for obj, _ in pairs(dirtyObjects) do
-        if obj and obj.Update then
-            obj:Update()
-            obj._dirty = false
-            processed = processed + 1
-            
-            if processed >= BATCH_SIZE then
-                break
-            end
-        end
-    end
-    
-    -- Clear processed objects
-    for obj, _ in pairs(dirtyObjects) do
-        if not obj._dirty then
-            dirtyObjects[obj] = nil
-        end
-    end
-end
-
--- Performance monitoring
-local function updatePerformanceStats()
-    frameCount = frameCount + 1
-    local currentTime = tick()
-    
-    if currentTime - lastFrameTime >= 1 then
-        fpsCounter = frameCount
-        frameCount = 0
-        lastFrameTime = currentTime
-        
-        -- Count active objects
-        local activeCount = 0
-        for _ in pairs(activeObjects) do
-            activeCount = activeCount + 1
-        end
-        
-        -- Count dirty objects
-        local dirtyCount = 0
-        for _ in pairs(dirtyObjects) do
-            dirtyCount = dirtyCount + 1
-        end
-        
-        -- Log performance stats
-        print(string.format("Drawing Library FPS: %d, Active Objects: %d, Dirty Objects: %d", 
-            fpsCounter, 
-            activeCount, 
-            dirtyCount
-        ))
-    end
-end
-
--- Main render loop with performance optimization
-local function renderLoop()
-    processRenderQueue()
-    updatePerformanceStats()
-end
-
--- Connect render loop to RunService
-runService:BindToRenderStep("DrawingLibraryRender", Enum.RenderPriority.Camera.Value + 1, renderLoop)
-
--- Global API
 getgenv().Drawing = {
-    Fonts = DrawingLib.Fonts,
+    Fonts = {
+        ["UI"] = 0,
+        ["System"] = 1,
+        ["Plex"] = 2,
+        ["Monospace"] = 3
+    },
     
     new = function(drawingType)
+        drawingIndex += 1
         if drawingType == "Line" then
             return DrawingLib.createLine()
         elseif drawingType == "Text" then
@@ -1612,6 +931,8 @@ getgenv().Drawing = {
             return DrawingLib.createTriangle()
         elseif drawingType == "Frame" then
             return DrawingLib.createFrame()
+        elseif drawingType == "ScreenGui" then
+            return DrawingLib.createScreenGui()
         elseif drawingType == "TextButton" then
             return DrawingLib.createTextButton()
         elseif drawingType == "TextLabel" then
@@ -1624,65 +945,41 @@ getgenv().Drawing = {
     end
 }
 
--- Utility functions
 getgenv().isrenderobj = function(drawingObj)
-    return activeObjects[drawingObj] ~= nil
+    local success, isrenderobj = pcall(function()
+		return drawingObj.Parent == drawingUI
+	end)
+	if not success then return false end
+	return isrenderobj
 end
 
 getgenv().getrenderproperty = function(drawingObj, property)
-    if not activeObjects[drawingObj] then
-        error("getrenderproperty: object is not a valid drawing object", 2)
+    if type(drawingObj) ~= "table" and type(drawingObj) ~= "userdata" then
+        error("getrenderproperty: expected drawingObj to be table or userdata, got " .. type(drawingObj), 2)
     end
-    
-    if property == "TextBounds" and drawingObj._type == "Text" then
-        return drawingObj._uiObject and drawingObj._uiObject.TextBounds or Vector2.zero
+    if type(property) ~= "string" then
+        error("getrenderproperty: property name must be a string, got " .. type(property), 2)
     end
-    
-    return drawingObj:GetProperty(property)
+    local success, drawingProperty = pcall(function()
+        return drawingObj[property]
+    end)
+    if not success then
+        error("getrenderproperty: failed to get property '" .. property .. "': " .. tostring(drawingProperty), 2)
+    end
+    if drawingProperty == nil then
+        error("getrenderproperty: property '" .. property .. "' is nil or does not exist", 2)
+    end
+    return drawingProperty
 end
 
+
 getgenv().setrenderproperty = function(drawingObj, property, value)
-    if not activeObjects[drawingObj] then
-        error("setrenderproperty: object is not a valid drawing object", 2)
-    end
-    
-    drawingObj:SetProperty(property, value)
+	assert(getgenv().getrenderproperty(drawingObj, property), "'" .. tostring(property) .. "' is not a valid property of " .. tostring(drawingObj) .. ", " .. tostring(typeof(drawingObj)))
+	drawingObj[property]  = value
 end
 
 getgenv().cleardrawcache = function()
-    -- Clear all active objects
-    for obj, _ in pairs(activeObjects) do
-        obj:Remove()
-    end
-    
-    -- Clear dirty objects
-    for obj, _ in pairs(dirtyObjects) do
-        dirtyObjects[obj] = nil
-    end
-    
-    -- Clear object pools
-    for objectType, pool in pairs(objectPools) do
-        for i = #pool, 1, -1 do
-            local obj = pool[i]
-            if obj._uiObject then
-                obj._uiObject:Destroy()
-            end
-            table.remove(pool, i)
-        end
-    end
-    
-    print("Drawing cache cleared. All objects removed and pools reset.")
+	for _, drawing in drawingUI:GetDescendants() do
+		drawing:Remove()
+	end
 end
-
--- Performance optimization tips
-print("=== PERFORMANCE OPTIMIZED DRAWING LIBRARY LOADED ===")
-print("Features:")
-print("- Object pooling for memory efficiency")
-print("- Batch rendering to prevent FPS drops")
-print("- Smart property updates (only when changed)")
-print("- Automatic culling for off-screen objects")
-print("- Minimal UI instance creation")
-print("- Performance monitoring and stats")
-print("")
-print("Usage: local line = Drawing.new('Line')")
-print("Performance: Monitor FPS in console output")
