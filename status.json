@@ -1,1 +1,6 @@
-{\n  "Version": "1.2.8",\n  "Status": "down",\n  "SupportedClientVers": "version-31fc142272764f02",\n  "FetchCurrentClientVers": "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer/channel/live"\n}
+{
+  "Version": "1.2.8",
+  "Status": "up",
+  "SupportedClientVers": "version-31fc142272764f02",
+  "FetchCurrentClientVers": "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer/channel/live"
+}
