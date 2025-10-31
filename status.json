@@ -1,6 +1,6 @@
 {
-  "Version": "1.2.8",
-  "Status": "down",
-  "SupportedClientVers": "version-31fc142272764f02",
+  "Version": "1.0.0",
+  "Status": "up",
+  "SupportedClientVers": "version-889d2588b25a43d1",
   "FetchCurrentClientVers": "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer/channel/live"
 }
